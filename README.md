@@ -2,6 +2,7 @@
 
 [![Build .NET](https://github.com/ymauray/xtraktor/actions/workflows/dotnet.yml/badge.svg)](https://github.com/ymauray/xtraktor/actions/workflows/dotnet.yml)
 [![Licence MIT](https://img.shields.io/badge/Licence-MIT-yellow.svg)](LICENSE)
+[![repocheck](https://img.shields.io/badge/repocheck%201.3.0-100%2F100-brightgreen)](https://github.com/ymauray/repocheck)
 
 Xtraktor est un outil en ligne de commande (CLI) développé en .NET 10 qui extrait le texte d'un roman publié (PDF d'impression, EPUB ou manuscrit Word), compare les versions entre elles et reconstitue un manuscrit Word (`.docx`).
 
