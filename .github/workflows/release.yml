@@ -1,0 +1,217 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag à simuler (ex: v0.1.1)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.x'
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Test
+        run: dotnet test --no-build --configuration Release --verbosity normal
+
+  build:
+    name: Build (${{ matrix.rid }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+            archive: xtraktor-linux-x64.tar.gz
+          - os: windows-latest
+            rid: win-x64
+            archive: xtraktor-win-x64.zip
+          - os: macos-latest
+            rid: osx-arm64
+            archive: xtraktor-osx-arm64.tar.gz
+
+    steps:
+      - name: Set release tag
+        run: echo "RELEASE_TAG=${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}" >> $GITHUB_ENV
+        shell: bash
+
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.x'
+
+      - name: Publish
+        shell: bash
+        run: >
+          dotnet publish Xtraktor/xtraktor.csproj
+          -c Release
+          -r ${{ matrix.rid }}
+          --self-contained
+          -p:PublishSingleFile=true
+          -p:Version=${RELEASE_TAG#v}
+          -o out
+
+      - name: Smoke test
+        if: runner.os != 'Windows'
+        run: ./out/xtraktor --version
+
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        run: .\out\xtraktor.exe --version
+
+      - name: Archive (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: tar -czf ${{ matrix.archive }} -C out xtraktor
+
+      - name: Archive (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path out\xtraktor.exe -DestinationPath ${{ matrix.archive }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+
+      - name: Install nfpm
+        if: runner.os == 'Linux'
+        run: |
+          echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' | sudo tee /etc/apt/sources.list.d/goreleaser.list
+          sudo apt-get update -q
+          sudo apt-get install -y nfpm
+
+      - name: Package (.deb / .rpm)
+        if: runner.os == 'Linux'
+        run: |
+          VERSION=${RELEASE_TAG#v} nfpm package --config nfpm.yaml --packager deb --target xtraktor-linux-x64.deb
+          VERSION=${RELEASE_TAG#v} nfpm package --config nfpm.yaml --packager rpm --target xtraktor-linux-x64.rpm
+
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Linux'
+        with:
+          name: xtraktor-linux-x64.deb
+          path: xtraktor-linux-x64.deb
+
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Linux'
+        with:
+          name: xtraktor-linux-x64.rpm
+          path: xtraktor-linux-x64.rpm
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set release tag
+        run: echo "RELEASE_TAG=${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}" >> $GITHUB_ENV
+
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          path: artifacts
+
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: artifacts/*
+          generate_release_notes: true
+
+      - name: Update Homebrew tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION=${RELEASE_TAG#v}
+          MACOS_SHA=$(curl -sL "https://github.com/ymauray/xtraktor/releases/download/${RELEASE_TAG}/xtraktor-osx-arm64.tar.gz" | sha256sum | cut -d' ' -f1)
+          LINUX_SHA=$(curl -sL "https://github.com/ymauray/xtraktor/releases/download/${RELEASE_TAG}/xtraktor-linux-x64.tar.gz" | sha256sum | cut -d' ' -f1)
+
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/ymauray/homebrew-tap.git" tap
+          cd tap
+          BRANCH="automation/xtraktor/${RELEASE_TAG}"
+          PR_STATE=$(GH_TOKEN="${HOMEBREW_TAP_TOKEN}" gh pr list --repo ymauray/homebrew-tap --head "$BRANCH" --state all --json state --jq '.[0].state // empty')
+          if [ "$PR_STATE" = "CLOSED" ]; then
+            echo "The Homebrew pull request for ${RELEASE_TAG} was closed without merging."
+            exit 1
+          fi
+          git checkout -B "$BRANCH"
+
+          VERSION=$VERSION MACOS_SHA=$MACOS_SHA LINUX_SHA=$LINUX_SHA python3 << 'PYEOF'
+          import re, os
+          content = open('Formula/xtraktor.rb').read()
+          content = re.sub(r'version "[^"]*"', f'version "{os.environ["VERSION"]}"', content)
+          shas = iter([os.environ['MACOS_SHA'], os.environ['LINUX_SHA']])
+          content = re.sub(r'sha256 "[a-f0-9]*"', lambda m: f'sha256 "{next(shas)}"', content)
+          open('Formula/xtraktor.rb', 'w').write(content)
+          PYEOF
+
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add Formula/xtraktor.rb
+          if git diff --staged --quiet; then
+            exit 0
+          fi
+          git commit -m "bump xtraktor to ${VERSION}"
+          git push --force-with-lease origin "$BRANCH"
+          if [ -z "$PR_STATE" ]; then
+            GH_TOKEN="${HOMEBREW_TAP_TOKEN}" gh pr create --repo ymauray/homebrew-tap --base main --head "$BRANCH" --title "bump xtraktor to ${VERSION}" --body "Automated release update for ${RELEASE_TAG}."
+          fi
+
+      - name: Update Scoop bucket
+        env:
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+        run: |
+          VERSION=${RELEASE_TAG#v}
+          WIN_SHA=$(curl -sL "https://github.com/ymauray/xtraktor/releases/download/${RELEASE_TAG}/xtraktor-win-x64.zip" | sha256sum | cut -d' ' -f1)
+
+          git clone "https://x-access-token:${SCOOP_BUCKET_TOKEN}@github.com/ymauray/scoop-bucket.git" scoop
+          cd scoop
+          BRANCH="automation/xtraktor/${RELEASE_TAG}"
+          PR_STATE=$(GH_TOKEN="${SCOOP_BUCKET_TOKEN}" gh pr list --repo ymauray/scoop-bucket --head "$BRANCH" --state all --json state --jq '.[0].state // empty')
+          if [ "$PR_STATE" = "CLOSED" ]; then
+            echo "The Scoop pull request for ${RELEASE_TAG} was closed without merging."
+            exit 1
+          fi
+          git checkout -B "$BRANCH"
+
+          VERSION=$VERSION WIN_SHA=$WIN_SHA python3 -c "
+          import json, os
+          v = os.environ['VERSION']
+          m = json.load(open('xtraktor.json'))
+          m['version'] = v
+          m['architecture']['64bit']['url'] = 'https://github.com/ymauray/xtraktor/releases/download/v' + v + '/xtraktor-win-x64.zip'
+          m['architecture']['64bit']['hash'] = 'sha256:' + os.environ['WIN_SHA']
+          open('xtraktor.json', 'w').write(json.dumps(m, indent=4) + '\n')
+          "
+
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add xtraktor.json
+          if git diff --staged --quiet; then
+            exit 0
+          fi
+          git commit -m "bump xtraktor to ${VERSION}"
+          git push --force-with-lease origin "$BRANCH"
+          if [ -z "$PR_STATE" ]; then
+            GH_TOKEN="${SCOOP_BUCKET_TOKEN}" gh pr create --repo ymauray/scoop-bucket --base main --head "$BRANCH" --title "bump xtraktor to ${VERSION}" --body "Automated release update for ${RELEASE_TAG}."
+          fi

@@ -1,0 +1,14 @@
+name: xtraktor
+arch: amd64
+platform: linux
+version: ${VERSION}
+maintainer: Yannick Mauray
+description: Extracteur et comparateur de texte de romans (PDF, EPUB, Word) écrit en .NET 10
+homepage: https://github.com/ymauray/xtraktor
+license: MIT
+
+contents:
+  - src: out/xtraktor
+    dst: /usr/local/bin/xtraktor
+    file_info:
+      mode: 0755
